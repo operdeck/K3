@@ -12,7 +12,8 @@ library(RANN)
 library(ipred)
 # library(partykit)
 # library(C50)
-library(ada)
+# library(ada)
+library(gbm)
 
 # https://www.kaggle.com/c/telstra-recruiting-network/data
 
@@ -34,12 +35,14 @@ library(ada)
 # 0.6023409 (TBD)       now excluding the validation set from the binning - should report more accurate score
 # 0.6033233 -           same but not tuning (surprisingly small effect)
 # 0.6564631 - (??)      with 5% validation instead of 20
-# 0.6553885 - (???)     with 5% validation and parameter tuning ... 
-# 0.650963  -           just a different random seed
-# 0.6411956 -           and another random seed ...
-# 
+# 0.6553885 0.66519     with 5% validation and parameter tuning ... 
+# 0.650963  0.65787     just a different random seed
+# 0.6402995 0.66351     tune length 10 (instead of 3)
+# 0.6410911 0.66377     no parameter tuning (keeping NA imputation and 5% validation)
+# 0.6973874 -           param tuning with C5.0 classifier
+# 0.4177428 0.61144*    including sd and a few more and running GBM classifier
+
 # ..        ..          nice to try C50 or ada but they take forever
-# TODO: submit for tuned glmnet, distinct models, NA imputation, proper validation scoring and 5% validation
 
 set.seed(491)
 
@@ -98,7 +101,7 @@ for (outcomeName in names(y)) {
 }
 
 # With a low threshold for SB, there can be NAs so we do imputation. Also, we only continue with the numerics now.
-print("NA imputation:")
+print("NA imputation on expanded data:")
 train <- train[, sapply(train, is.numeric), with=F]
 test <- test[, sapply(test, is.numeric), with=F]
 cat("Any incomplete cases in development set?", any(!complete.cases(train[-validationSetRows])),fill=T)
@@ -125,9 +128,9 @@ aggregate <- function(idCol, valCol, colNamePrefix) {
 #                                        distinct = n_distinct(val), # seems to have a negative impact
 #                                        sum = sum(val), 
                                        # this introduces NAs
-#                                        sd = sd(val), 
-#                                        median = median(val),
-#                                        iqr = IQR(val),
+                                       sd = sd(val), 
+                                       median = median(val),
+                                       iqr = IQR(val),
                                        n = n())   
   setnames(s, c("id",paste(colNamePrefix,names(s),sep="_")[2:length(names(s))]))
   return(s)
@@ -151,6 +154,21 @@ for (numColName in setdiff(names(train)[sapply(train, is.numeric)], c("id"))) {
 # return to the original order of the IDs
 trainData <- trainData[ match(train_id, trainData$id), ]
 testData <- testData[ match(test_id, testData$id), ]
+
+# Some aggregators (like sd) can cause NAs
+print("NA imputation on aggregated data:")
+cat("Any incomplete cases in development set?", any(!complete.cases(trainData[-validationSetRows])),fill=T)
+cat("Any incomplete cases in validation set?",any(!complete.cases(trainData[validationSetRows,])),fill=T)
+cat("Any incomplete cases in testData set?",any(!complete.cases(testData)),fill=T)
+# NB if we want to be more efficicient we can do this for only the columns containing NA in the
+# train set. The previous impute could check for columns in the test set.
+# naCols <- which(sapply(trainData, function(x) {return(any(is.na(x)))}))
+fixUp <- preProcess(trainData[-validation], method=c("bagImpute"), verbose=T) # medianImpute is faster but assumes independence
+trainData <- predict(fixUp, trainData)
+testData <- predict(fixUp, testData)
+cat("Any incomplete cases in development set?", any(!complete.cases(trainData[-validationSetRows])),fill=T)
+cat("Any incomplete cases in validation set?",any(!complete.cases(trainData[validationSetRows,])),fill=T)
+cat("Any incomplete cases in testData set?",any(!complete.cases(testData)),fill=T)
 
 # (near) zero variance
 nzv <- colnames(trainData)[nearZeroVar(trainData)]
@@ -193,8 +211,8 @@ if (T) {
     cat("Predicting (single-class)", target, fill=T)
     trainData$y <- factor(ifelse(train_fault_severity == target, "Yes", "No")) 
     
-    model <- train(y ~ ., data = trainData[-validation], method = "glmnet" # "glmnet" #"rpart"
-                   ,tuneLength = 3
+    model <- train(y ~ ., data = trainData[-validation], method = "gbm" # "glmnet" #"rpart"
+                   ,tuneLength = 10
                    ,metric = "logLoss"
                    ,maximize=F
                    ,trControl = cvCtrl
