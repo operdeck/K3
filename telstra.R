@@ -48,11 +48,18 @@ library(gbm)
 # 0.6355389 0.67103     reviewed code, added graphs - this was with glmnet
 # 0.6028989 0.62564     long GBM run but also lower correlation threshold (fewer vars)
 # 0.5916207 0.62367     finetuned search grid (10% validation) 10/5 cv
-# 0.6230756 0.61083*    but same position on LB :(
-# * more tuning and 1% validation (irrelevant - validate to LB)
-# class 0 Fitting n.trees = 400, interaction.depth = 7, shrinkage = 0.05, n.minobsinnode = 10 on full training set
-# class 1 Fitting n.trees = 400, interaction.depth = 6, shrinkage = 0.05, n.minobsinnode = 10 on full training set
-# class 2 Fitting n.trees = 350, interaction.depth = 7, shrinkage = 0.05, n.minobsinnode = 10 on full training set
+# 0.6230756 0.61083*    but same position on LB :( more tuning and 1% validation (irrelevant - validate to LB)
+#                       class 0 Fitting n.trees = 400, interaction.depth = 7, shrinkage = 0.05, n.minobsinnode = 10 on full training set
+#                       class 1 Fitting n.trees = 400, interaction.depth = 6, shrinkage = 0.05, n.minobsinnode = 10 on full training set
+#                       class 2 Fitting n.trees = 350, interaction.depth = 7, shrinkage = 0.05, n.minobsinnode = 10 on full training set
+# 0.5926326 0.61089     Fitting n.trees = 600, interaction.depth = 9, shrinkage = 0.02, n.minobsinnode = 10 on full training set
+# 0.6203718 0.61277     Fitting n.trees = 700, interaction.depth = 10, shrinkage = 0.02, n.minobsinnode = 10 on full training set
+# 0.6096836 0.60836*    Correlation threshold .99 (instead of .95)
+#                       Fitting n.trees = 650-700, interaction.depth = 10, shrinkage = 0.02, n.minobsinnode = 10 on full training set
+#                       Took very long
+#
+# .. for the fun of it - try returning bin index instead of recoded values
+# .. w/o tuning just use parameters
 
 set.seed(491)
 val_pct <- 1
@@ -225,7 +232,7 @@ cat("Before highly correlated:",dim(trainData),fill=T)
 
 # remove highly correlated variables
 trainCor <- cor( trainData, method='spearman')
-correlatedVars <- colnames(trainData)[findCorrelation(trainCor, cutoff = 0.95, verbose = F)]
+correlatedVars <- colnames(trainData)[findCorrelation(trainCor, cutoff = 0.99, verbose = F)]
 cat("Removed highly correlated cols:", length(correlatedVars), 
     "(of", length(names(trainData)), ")", correlatedVars, fill=T)
 trainData <- trainData[,!(names(trainData) %in% correlatedVars)]
@@ -285,9 +292,9 @@ crossValidation <- trainControl(method = "repeatedcv",
                                 classProbs = TRUE,
                                 verbose=T)
 
-gbmGrid <-  expand.grid(interaction.depth = seq(5,7,by=1),  # more better at lower shrinkage
-                        n.trees = seq(200,400,by=50), # more better at lower shrinkage
-                        shrinkage = c(0.02,0.05), # 0.1 was worse
+gbmGrid <-  expand.grid(interaction.depth = seq(8,10,by=1),  # more better at lower shrinkage
+                        n.trees = seq(500,700,by=50), # more better at lower shrinkage
+                        shrinkage = c(0.02,0.01,0.005), # 0.1 was worse
                         n.minobsinnode = 10) # doesnt seem to matter much
 
 # now create model for all 3 outcomes seperately and score test set
