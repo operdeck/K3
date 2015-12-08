@@ -286,16 +286,21 @@ print(ggplot(univariates2, aes(x=predictor, y=auc, fill=severity)) +
 # cat("Remaining correlations: ", summary(descrCor2[upper.tri(descrCor2)]), fill=T)
 
 # see https://www.r-project.org/nosvn/conferences/useR-2013/Tutorials/kuhn/user_caret_2up.pdf
-crossValidation <- trainControl(method = "repeatedcv", 
+crossValidation <- trainControl(#method = "repeatedcv",
+                                method = "none", # Fitting Models Without Parameter Tuning
                                 repeats = 5, number=10,
                                 summaryFunction = mnLogLoss,
                                 classProbs = TRUE,
                                 verbose=T)
 
-gbmGrid <-  expand.grid(interaction.depth = seq(8,10,by=1),  # more better at lower shrinkage
-                        n.trees = seq(500,700,by=50), # more better at lower shrinkage
-                        shrinkage = c(0.02,0.01,0.005), # 0.1 was worse
-                        n.minobsinnode = 10) # doesnt seem to matter much
+# gbmGrid <-  expand.grid(interaction.depth = seq(8,10,by=1),  # more better at lower shrinkage
+#                         n.trees = seq(500,700,by=50), # more better at lower shrinkage
+#                         shrinkage = c(0.02,0.01,0.005), # 0.1 was worse
+#                         n.minobsinnode = 10) # doesnt seem to matter much
+gbmGrid <- data.frame(interaction.depth = 10,
+                      n.trees = 650,
+                      shrinkage = 0.02,
+                      n.minobsinnode = 10)
 
 # now create model for all 3 outcomes seperately and score test set
 trainResults <- data.frame(id = train_ori_id, 
@@ -318,8 +323,10 @@ for (target in c(0,1,2)) {
                  ,verbose=F
   )
   
-  trellis.par.set(caretTheme())
-  print(plot(model))
+  if (nrow(gbmGrid) > 1) {
+    trellis.par.set(caretTheme())
+    print(plot(model))
+  }
   
   trainResults[[paste("predict",target,sep="_")]] <- predict.train(model, trainData, type="prob")[,2]
   testResults[[paste("predict",target,sep="_")]] <- predict.train(model, testData, type="prob")[,2]
