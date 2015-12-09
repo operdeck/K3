@@ -6,6 +6,7 @@ source("util/funcs.R")
 library(data.table)
 library(ggplot2)
 library(lattice)
+library(plyr) # used by caret
 library(dplyr)
 library(tidyr)
 library(pROC)
@@ -57,7 +58,14 @@ library(gbm)
 # 0.6096836 0.60836*    Correlation threshold .99 (instead of .95)
 #                       Fitting n.trees = 650-700, interaction.depth = 10, shrinkage = 0.02, n.minobsinnode = 10 on full training set
 #                       Took very long
+# 0.4349778 0.58856*    With feature_log aggregates and clustering. 20% val. 95% corr th. Removed some slow aggregates. No GBM tuning.
+# 0.3883476 0.59890     1% val, few aggregates re-enabled (making it much slower)
+# 0.3877019 0.59891     1% val, most extra aggregates gone
+# 0.3744574 0.60208     1% val as opposed to 20% earlier - what the hack - maybe overfitting is the bigger problem
+# 0.4783086 0.60074     40% validation... Final set: 7381 x 268
+# 0.436575 settings back to (*) I hope - score is similar but not the same, only diff seems to a name (n vs sum)
 #
+# .. maybe add another cluster as well on event_type?? and do that first??
 # .. for the fun of it - try returning bin index instead of recoded values
 # .. w/o tuning just use parameters
 
@@ -76,7 +84,7 @@ severity_type <- fread("data/severity_type.csv")
 train_ori_id <- trn_ori$id
 train_ori_fault_severity <- trn_ori$fault_severity
 test_ori_id <- tst_ori$id
-val_indices_ori <- sample(nrow(trn_ori), val_pct*0.01*nrow(trn_ori))
+val_indices_ori <- sample(nrow(trn_ori), val_pct*0.20*nrow(trn_ori))
 
 # Join all together - this will result in a much taller dataset
 
@@ -99,6 +107,52 @@ overlap <- sapply(names(test_joined), function(c)
                       length(unique(test_joined[[c]])),2),"%",sep=""))})
 print("Overlap test-train set:")
 print(overlap)
+
+# Create dummy vars and cluster for the info tables alone
+info <- log_feature %>%
+  left_join(resource_type) %>%
+  left_join(severity_type) %>%
+  left_join(event_type) %>%
+  select(-id)
+
+print("Distinct values:")
+print(sapply(info, function(c) {return(length(unique(c)))}))
+
+# Create dummy vars (key is assumed to be col 1)
+hotOne <- data.frame(key=info[[1]])
+for (c in 2:ncol(info)) {
+  hotOne <- cbind(hotOne, data.frame(model.matrix(~.-1,subset(info,select=c))))
+}
+
+# Summarize
+summarized <- hotOne %>% group_by(key) %>% dplyr::summarise(cnt_key = n())
+for (c in 2:ncol(hotOne)) {
+  xx <- data.frame(key=hotOne$key, val=hotOne[[c]]) %>% group_by(key) %>% 
+    dplyr::summarise(x1 = sum(val),
+                     x2 = mean(val)) 
+  names(xx) <- c('val'
+                 ,paste(names(hotOne)[c],"sum",sep="_")
+#                  ,paste(names(hotOne)[c],"mean",sep="_")
+                 )
+  summarized <- cbind(summarized, subset(xx,select=2))
+}
+
+# Clusters
+sc <- scale(select(summarized, -key))
+wss <- (nrow(sc)-1)*sum(apply(sc,2,var))
+maxClusters <- 50
+for (i in 2:maxClusters) wss[i] <- sum(kmeans(sc, centers=i)$withinss)
+print(qplot(x=1:maxClusters,y=wss,geom="line")+
+        xlab("Number of Clusters")+
+        ylab("Within groups sum of squares")+
+        ggtitle("Cluster analysis"))
+fit <- kmeans(sc, 40) # fill in optimal cluster nr here
+summarized$FeatureCluster <- fit$cluster
+names(summarized)[1] <- names(info)[1] # set back original name for key
+
+# Join in cluster but also all the aggregated summaries
+train_joined <- left_join(train_joined, summarized, copy=TRUE)
+test_joined <- left_join(test_joined, summarized, copy=TRUE)
 
 y <- data.frame(y0 = train_joined$fault_severity == 0,
                 y1 = train_joined$fault_severity == 1,
@@ -132,6 +186,13 @@ myAUC <- function(response, predictor)
 train_joined <- train_joined[, sapply(train_joined, is.numeric), with=F]
 test_joined <- test_joined[, sapply(test_joined, is.numeric), with=F]
 
+
+g_by_log_feature_y0 <- group_by(train_joined, log_feature_y0) %>%
+  dplyr::summarise(by_log_feature_y0_n = n(),
+                   by_log_feature_y0_mean_location_y0 = mean(location_y0),
+                   by_log_feature_y0_mean_resource_type_y0 = mean(resource_type_y0),
+                   by_log_feature_y0_mean_volume_y0 = mean(volume_y0))
+
 # Report on univariate AUC
 univariates <- data.frame(
   y0 = sapply(names(train_joined), function(c) { return(myAUC(y$y0, train_joined[[c]]))}),
@@ -142,13 +203,14 @@ univariates <- gather( univariates, key="severity", value="auc", -predictor)
 levels(univariates$severity) <- c(0,1,2)
 print(ggplot(univariates, aes(x=predictor, y=auc, fill=severity)) + 
   geom_bar(stat="identity")+coord_flip()+geom_hline(yintercept=1.5))
+print(head(arrange(univariates, desc(auc))),10)
 
 # With a low threshold for SB, there can be NAs so we do imputation.
 print("NA imputation on expanded data:")
 cat("Any incomplete cases in development set?", any(!complete.cases(train_joined[-val_indices_joined])),fill=T)
 cat("Any incomplete cases in validation set?",any(!complete.cases(train_joined[val_indices_joined,])),fill=T)
 cat("Any incomplete cases in test set?",any(!complete.cases(test_joined)),fill=T)
-fixUp <- preProcess(train_joined[-val_indices_joined,], method=c("bagImpute"), verbose=T) # medianImpute is faster but assumes independence
+fixUp <- preProcess(train_joined[-val_indices_joined,], method=c("medianImpute"), verbose=T) # bagImpute / medianImpute is faster but assumes independence
 train_joined <- predict(fixUp, train_joined)
 test_joined <- predict(fixUp, test_joined)
 cat("Any incomplete cases in development set?", any(!complete.cases(train_joined[-val_indices_joined])),fill=T)
@@ -165,12 +227,12 @@ aggregate <- function(idCol, valCol, colNamePrefix) {
 #                                               first = first(val),
 #                                               last = last(val),
                                               # seems to have a negative impact:
-                                              mad = mad(val),
+#                                               mad = mad(val),
                                               #                                        distinct = n_distinct(val), # seems to have a negative impact
                                               # this introduces NAs:
-                                              sd = sd(val), 
-                                              median = median(val),
-                                              iqr = IQR(val),
+#                                               sd = sd(val), 
+#                                               median = median(val),
+#                                               iqr = IQR(val),
                                               n = n())   
   setnames(s, c("id",paste(colNamePrefix,names(s),sep="_")[2:length(names(s))]))
   return(s)
@@ -203,14 +265,14 @@ cat("Any incomplete cases in testData set?",any(!complete.cases(testData)),fill=
 # NB if we want to be more efficicient we can do this for only the columns containing NA in the
 # train set. The previous impute could check for columns in the test set.
 # naCols <- which(sapply(trainData, function(x) {return(any(is.na(x)))}))
-fixUp <- preProcess(trainData[-val_indices_ori,], method=c("bagImpute"), verbose=T) # medianImpute is faster but assumes independence
+fixUp <- preProcess(trainData[-val_indices_ori,], method=c("medianImpute"), verbose=T) # bagImpute/medianImpute is faster but assumes independence
 trainData <- predict(fixUp, trainData)
 testData <- predict(fixUp, testData)
 cat("Any incomplete cases in development set?", any(!complete.cases(trainData[-val_indices_joined])),fill=T)
 cat("Any incomplete cases in val_indices_ori set?",any(!complete.cases(trainData[val_indices_joined,])),fill=T)
 cat("Any incomplete cases in testData set?",any(!complete.cases(testData)),fill=T)
 
-cat("Before zero variance:",dim(trainData),fill=T)
+cat("Data set size before variable selection:",dim(trainData),fill=T)
 
 # (near) zero variance
 nzv <- colnames(trainData)[nearZeroVar(trainData)]
@@ -232,7 +294,7 @@ cat("Before highly correlated:",dim(trainData),fill=T)
 
 # remove highly correlated variables
 trainCor <- cor( trainData, method='spearman')
-correlatedVars <- colnames(trainData)[findCorrelation(trainCor, cutoff = 0.99, verbose = F)]
+correlatedVars <- colnames(trainData)[findCorrelation(trainCor, cutoff = 0.95, verbose = F)]
 cat("Removed highly correlated cols:", length(correlatedVars), 
     "(of", length(names(trainData)), ")", correlatedVars, fill=T)
 trainData <- trainData[,!(names(trainData) %in% correlatedVars)]
@@ -265,6 +327,8 @@ chopAggregator <- function(haystack, needle)
 }
 univariates2$target <- ifelse(strEndsWith(univariates2$feature, paste("_",univariates2$aggregator,sep="")),"",univariates2$target)
 univariates2$feature <- chopAggregator(univariates2$feature, paste("_",univariates2$aggregator,sep=""))
+
+print(head(arrange(univariates2, desc(auc))),10)
 
 # what do our aggregators do?
 print(ggplot(group_by(univariates2, aggregator, severity) %>% dplyr::summarise(mean_auc = mean(auc)), 
