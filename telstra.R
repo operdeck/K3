@@ -64,13 +64,26 @@ library(gbm)
 # 0.3744574 0.60208     1% val as opposed to 20% earlier - what the hack - maybe overfitting is the bigger problem
 # 0.4783086 0.60074     40% validation... Final set: 7381 x 268
 # 0.436575 settings back to (*) I hope - score is similar but not the same, only diff seems to a name (n vs sum)
-#
+# 0.4381896 0.60883     Adding cluster index for all tables, but not joining in all aggregates (so far fewer predictors)
+# 0.4272738 0.60723     at 1% validation
+# 0.4413344 0.62409     clusters as symbolic, rank instead of recode
+# 0.444007  0.60682     same, recode instead of rank
+# 0.4390447 0.59842     few more aggregates (median etc)
+# 0.4369168 (TODO)      packages updates and back to bagImputation (vs median); 10% val Final set: 7381 x 70
+# 0.4440401 (TODO)      same with xgbTree
+# Fitting nrounds = 4000, eta = 0.01, max_depth = 10, gamma = 1, colsample_bytree = 1, min_child_weight = 6 on full training set
+# 0.4393507 0.67235     grmpf - strange rank index added
+# 0.5326185 0.55223*    xgb with param tuning and no supervised binning
+
 # .. maybe add another cluster as well on event_type?? and do that first??
 # .. for the fun of it - try returning bin index instead of recoded values
 # .. w/o tuning just use parameters
+# time for XGB?
+
 
 set.seed(491)
-val_pct <- 1
+val_fraction <- 0.10
+doMultiClass <- T # multi-class or seperate predictions for each level
 
 trn_ori <- fread("data/train.csv")
 tst_ori <- fread("data/test.csv")
@@ -84,96 +97,165 @@ severity_type <- fread("data/severity_type.csv")
 train_ori_id <- trn_ori$id
 train_ori_fault_severity <- trn_ori$fault_severity
 test_ori_id <- tst_ori$id
-val_indices_ori <- sample(nrow(trn_ori), val_pct*0.20*nrow(trn_ori))
+val_indices_ori <- sample(nrow(trn_ori), val_fraction*nrow(trn_ori))
+
+# Just for exploration. This shows that
+#   incident [ 1:1 ] severity_type (5)
+#   incident [ 1:N ] log_feature (386), event_type (53), resource_type (10)
+#
+# Test set: 11171 x 2; 1039 unique locations (842 overlapping with train set)
+# Train set: 7381 x 2; 929 unique locations
+
+relations <- data.frame(
+  size = c(nrow(trn_ori), nrow(tst_ori)),
+  log_feature_join = c(nrow(left_join(trn_ori, log_feature)), nrow(left_join(tst_ori, log_feature))),
+  overlap = c(length(intersect( trn_ori$id, log_feature$id )), length(intersect( tst_ori$id, log_feature$id ))),
+  resource_type_join = c(nrow(left_join(trn_ori, resource_type)), nrow(left_join(tst_ori, resource_type))),
+  overlap = c(length(intersect( trn_ori$id, resource_type$id )), length(intersect( tst_ori$id, resource_type$id ))),
+  severity_type_join = c(nrow(left_join(trn_ori, severity_type)), nrow(left_join(tst_ori, severity_type))),
+  overlap = c(length(intersect( trn_ori$id, severity_type$id )), length(intersect( tst_ori$id, severity_type$id ))),
+  event_type_join = c(nrow(left_join(trn_ori, event_type)), nrow(left_join(tst_ori, event_type))),
+  overlap = c(length(intersect( trn_ori$id, event_type$id )), length(intersect( tst_ori$id, event_type$id ))))
+rownames(relations) <- c('train','test')
+print(relations)
+
+# Hot-one encoding of "severity_type"
+hotOneSeverityType <- data.table(id=severity_type$id,
+                                 model.matrix(~.-1,
+                                              mutate(severity_type, sev_type_=sub(".* ([0-9]+)", "\\1", severity_type)) %>% 
+                                                select(sev_type_)))
+
+# Hot-one encoding of "resource_type"
+hotOneResourceType <- data.table(id=resource_type$id,
+                                 model.matrix(~.-1,
+                                              mutate(resource_type, res_type_=sub(".* ([0-9]+)", "\\1", resource_type)) %>% 
+                                                select(res_type_)))
 
 # Join all together - this will result in a much taller dataset
-
-train_joined <- left_join(trn_ori, resource_type) %>% 
+train_joined <- trn_ori %>%
   left_join(log_feature) %>%
-  left_join(severity_type) %>%
-  left_join(event_type)
-
-test_joined <- left_join(tst_ori, resource_type) %>% 
+  left_join(event_type) %>%
+  left_join(hotOneSeverityType) %>% 
+  left_join(hotOneResourceType)
+test_joined <- tst_ori %>%
   left_join(log_feature) %>%
-  left_join(severity_type) %>%
-  left_join(event_type)
-
+  left_join(event_type) %>%
+  left_join(hotOneSeverityType) %>% 
+  left_join(hotOneResourceType)
 val_indices_joined <- which( train_joined$id %in% train_ori_id[ val_indices_ori ])
+
+# print(filter(train_joined, location=="location 1111"))
+
+# Try un-supervised clustering for "location", "log_feature" and "event_type"
+clusterSource <- rbind(select(trn_ori, -fault_severity), tst_ori) %>%
+        left_join(log_feature) %>%
+        left_join(event_type) %>%
+        left_join(hotOneSeverityType) %>% 
+        left_join(hotOneResourceType) %>%
+  select(-id)
+
+# Create clusters
+symCols <- which(sapply(clusterSource, class) == "character")
+for (clusterColIndex in symCols) {
+  clusterColName <- names(clusterSource)[clusterColIndex]
+  
+  # Data table with the cluster key plus all numeric columns
+  clusterSourceNums <- data.table(clusterCol=clusterSource[[clusterColIndex]])
+  clusterSourceNums <- cbind(clusterSourceNums, clusterSource[,-symCols,with=F])
+  
+  # Summary of the table keyed by cluster key and aggregations of all numeric columns
+  summarized <- clusterSourceNums %>% group_by(clusterCol) %>% dplyr::summarise(cnt_clusterCol = n())
+  for (c in 2:ncol(clusterSourceNums)) {
+    xx <- data.frame(clusterCol=clusterSourceNums$clusterCol, val=clusterSourceNums[[c]]) %>% group_by(clusterCol) %>% 
+      dplyr::summarise(x1 = sum(val))
+    names(xx) <- c('clusterCol', paste(names(clusterSourceNums)[c],"sum",sep="_"))
+    summarized <- cbind(summarized, subset(xx,select=2))
+  }
+  
+  # Cluster the summarized table
+  sc <- scale(select(summarized, -clusterCol))
+  wss <- (nrow(sc)-1)*sum(apply(sc,2,var))
+  maxClusters <- min(100, nrow(sc)/2)
+  for (i in 2:maxClusters) wss[i] <- sum(kmeans(sc, centers=i)$withinss)
+  print(qplot(x=1:maxClusters,y=wss,geom="line")+
+          xlab("Number of Clusters")+
+          ylab("Within groups sum of squares")+
+          ggtitle(paste("Cluster analysis for", clusterColName)))
+  
+  nClusters <- NA
+  if (clusterColName == "event_type") {
+    nClusters <- 5
+  } else if (clusterColName == "log_feature") {
+    nClusters <- 10
+  } else if (clusterColName == "location") {
+    nClusters <- 20
+  }
+  # Create a table with just the cluster column and the cluster index and join
+  # these to the train/test sets. Potentially we could also add all summarized/aggregated
+  # other fields (cbind with summarized) but I dont think that will add much.
+  clusterIndex <- data.table( clusterCol = summarized$clusterCol,
+                              clusterFit = as.character(kmeans(sc, nClusters)$cluster ))
+  names(clusterIndex) <- c(clusterColName, paste(clusterColName, "cluster", sep="_"))
+  train_joined <- left_join(train_joined, clusterIndex)
+  test_joined <- left_join(test_joined, clusterIndex)
+}
+
+# Straightforward encoding or Supervised binning for "location", "log_feature" and "event_type" and all other
+# remaining symbolics
+# (they have too many values for hot-one encoding)
+y <- data.frame(y0 = train_joined$fault_severity == 0,
+                y1 = train_joined$fault_severity == 1,
+                y2 = train_joined$fault_severity == 2)
+train_joined <- select(train_joined, -fault_severity)
+
+doSymBinning <- F
+
+colNames <- names(train_joined)[which(sapply(train_joined, class) == "character")]
+for (colName in colNames) {
+  if (!doSymBinning) {
+    binnedColName <- paste(colName,"factor",sep="_")
+    lev <- levels(as.factor(c(train_joined[[colName]], 
+                              test_joined[[colName]])))
+    train_joined[[binnedColName]] <- as.integer(factor(train_joined[[colName]], levels=lev) )
+    test_joined[[binnedColName]] <- as.integer(factor(test_joined[[colName]], levels=lev) )
+  } else {
+    for (outcomeName in names(y)) {
+      outcome <- y[[outcomeName]][-val_indices_joined]
+      binnedColName <- paste(colName,outcomeName,sep="_")
+      cat("Symbolic binning",colName,"->",binnedColName,fill=T)
+      binner <- createSymbin(train_joined[[colName]][-val_indices_joined], outcome, 0)
+      train_joined[[binnedColName]] <- applySymbin(binner, train_joined[[colName]]) 
+      test_joined[[binnedColName]] <- applySymbin(binner, test_joined[[colName]]) 
+    }
+    # An extra variable that indicates the order _y0 > _y1 > _y2 etc?
+    # rank y0 y1 Y2  3 x rank y0 + rank y1
+    #       1  2  3  5
+    #       1  3  2  6
+    #       2  1  3  7
+    #       2  3  1  9
+    #       3  1  2  10
+    #       3  2  1  12
+  #   train_recodes <- data.frame(y0 = train_joined[[paste(colName,"y0",sep="_")]],
+  #                               y1 = train_joined[[paste(colName,"y1",sep="_")]],
+  #                               y2 = train_joined[[paste(colName,"y2",sep="_")]])
+  #   train_recodes <- cbind(train_recodes, t(apply(train_recodes, 1, rank, ties.method= "first")))
+  #   train_joined[[paste(colName, "binorder", sep="_")]] <- train_recodes[,4]*3+train_recodes[,5]
+  # 
+  #   test_recodes <- data.frame(y0 = test_joined[[paste(colName,"y0",sep="_")]],
+  #                               y1 = test_joined[[paste(colName,"y1",sep="_")]],
+  #                               y2 = test_joined[[paste(colName,"y2",sep="_")]])
+  #   test_recodes <- cbind(test_recodes, t(apply(test_recodes, 1, rank, ties.method= "first")))
+  #   test_joined[[paste(colName, "binorder", sep="_")]] <- test_recodes[,4]*3+test_recodes[,5]
+  }
+}
 
 # Check how many of the values in the test set are in the train set
 # these are currently set to the average outcome
 overlap <- sapply(names(test_joined), function(c) 
 {return(paste(round(100*length(intersect(train_joined[[c]], test_joined[[c]]))/
                       length(unique(test_joined[[c]])),2),"%",sep=""))})
-print("Overlap test-train set:")
+print("How many in the test set are contained in the train set:")
 print(overlap)
-
-# Create dummy vars and cluster for the info tables alone
-info <- log_feature %>%
-  left_join(resource_type) %>%
-  left_join(severity_type) %>%
-  left_join(event_type) %>%
-  select(-id)
-
-print("Distinct values:")
-print(sapply(info, function(c) {return(length(unique(c)))}))
-
-# Create dummy vars (key is assumed to be col 1)
-hotOne <- data.frame(key=info[[1]])
-for (c in 2:ncol(info)) {
-  hotOne <- cbind(hotOne, data.frame(model.matrix(~.-1,subset(info,select=c))))
-}
-
-# Summarize
-summarized <- hotOne %>% group_by(key) %>% dplyr::summarise(cnt_key = n())
-for (c in 2:ncol(hotOne)) {
-  xx <- data.frame(key=hotOne$key, val=hotOne[[c]]) %>% group_by(key) %>% 
-    dplyr::summarise(x1 = sum(val),
-                     x2 = mean(val)) 
-  names(xx) <- c('val'
-                 ,paste(names(hotOne)[c],"sum",sep="_")
-#                  ,paste(names(hotOne)[c],"mean",sep="_")
-                 )
-  summarized <- cbind(summarized, subset(xx,select=2))
-}
-
-# Clusters
-sc <- scale(select(summarized, -key))
-wss <- (nrow(sc)-1)*sum(apply(sc,2,var))
-maxClusters <- 50
-for (i in 2:maxClusters) wss[i] <- sum(kmeans(sc, centers=i)$withinss)
-print(qplot(x=1:maxClusters,y=wss,geom="line")+
-        xlab("Number of Clusters")+
-        ylab("Within groups sum of squares")+
-        ggtitle("Cluster analysis"))
-fit <- kmeans(sc, 40) # fill in optimal cluster nr here
-summarized$FeatureCluster <- fit$cluster
-names(summarized)[1] <- names(info)[1] # set back original name for key
-
-# Join in cluster but also all the aggregated summaries
-train_joined <- left_join(train_joined, summarized, copy=TRUE)
-test_joined <- left_join(test_joined, summarized, copy=TRUE)
-
-y <- data.frame(y0 = train_joined$fault_severity == 0,
-                y1 = train_joined$fault_severity == 1,
-                y2 = train_joined$fault_severity == 2)
-
-train_joined <- select(train_joined, -fault_severity)
-
-# predict 'fault_severity' (which is 0, 1 or 2)
-colNames <- setdiff(names(train_joined), c("id"))
-for (outcomeName in names(y)) {
-  outcome <- y[[outcomeName]][-val_indices_joined]
-  for (colName in colNames) {
-    print(colName)
-    
-    binner <- createSymbin(train_joined[[colName]][-val_indices_joined], outcome, 0)
-    
-    binnedColName <- paste(colName,outcomeName,sep="_")
-    train_joined[[binnedColName]] <- applySymbin(binner, train_joined[[colName]]) 
-    test_joined[[binnedColName]] <- applySymbin(binner, test_joined[[colName]]) 
-  }
-}
 
 myAUC <- function(response, predictor)
 {
@@ -185,13 +267,6 @@ myAUC <- function(response, predictor)
 # Only keep numerics
 train_joined <- train_joined[, sapply(train_joined, is.numeric), with=F]
 test_joined <- test_joined[, sapply(test_joined, is.numeric), with=F]
-
-
-g_by_log_feature_y0 <- group_by(train_joined, log_feature_y0) %>%
-  dplyr::summarise(by_log_feature_y0_n = n(),
-                   by_log_feature_y0_mean_location_y0 = mean(location_y0),
-                   by_log_feature_y0_mean_resource_type_y0 = mean(resource_type_y0),
-                   by_log_feature_y0_mean_volume_y0 = mean(volume_y0))
 
 # Report on univariate AUC
 univariates <- data.frame(
@@ -210,7 +285,7 @@ print("NA imputation on expanded data:")
 cat("Any incomplete cases in development set?", any(!complete.cases(train_joined[-val_indices_joined])),fill=T)
 cat("Any incomplete cases in validation set?",any(!complete.cases(train_joined[val_indices_joined,])),fill=T)
 cat("Any incomplete cases in test set?",any(!complete.cases(test_joined)),fill=T)
-fixUp <- preProcess(train_joined[-val_indices_joined,], method=c("medianImpute"), verbose=T) # bagImpute / medianImpute is faster but assumes independence
+fixUp <- preProcess(train_joined[-val_indices_joined,], method=c("bagImpute"), verbose=T) # bagImpute / medianImpute is faster but assumes independence
 train_joined <- predict(fixUp, train_joined)
 test_joined <- predict(fixUp, test_joined)
 cat("Any incomplete cases in development set?", any(!complete.cases(train_joined[-val_indices_joined])),fill=T)
@@ -230,7 +305,7 @@ aggregate <- function(idCol, valCol, colNamePrefix) {
 #                                               mad = mad(val),
                                               #                                        distinct = n_distinct(val), # seems to have a negative impact
                                               # this introduces NAs:
-#                                               sd = sd(val), 
+                                              sd = sd(val), 
 #                                               median = median(val),
 #                                               iqr = IQR(val),
                                               n = n())   
@@ -260,16 +335,13 @@ testData <- testData[ match(test_ori_id, testData$id), ]
 # Some aggregators (like sd) can cause NAs
 print("NA imputation on aggregated data:")
 cat("Any incomplete cases in development set?", any(!complete.cases(trainData[-val_indices_joined])),fill=T)
-cat("Any incomplete cases in val_indices_ori set?",any(!complete.cases(trainData[val_indices_joined,])),fill=T)
+cat("Any incomplete cases in validation set?",any(!complete.cases(trainData[val_indices_joined,])),fill=T)
 cat("Any incomplete cases in testData set?",any(!complete.cases(testData)),fill=T)
-# NB if we want to be more efficicient we can do this for only the columns containing NA in the
-# train set. The previous impute could check for columns in the test set.
-# naCols <- which(sapply(trainData, function(x) {return(any(is.na(x)))}))
-fixUp <- preProcess(trainData[-val_indices_ori,], method=c("medianImpute"), verbose=T) # bagImpute/medianImpute is faster but assumes independence
+fixUp <- preProcess(trainData[-val_indices_ori,], method=c("bagImpute"), verbose=T) # bagImpute/medianImpute is faster but assumes independence
 trainData <- predict(fixUp, trainData)
 testData <- predict(fixUp, testData)
 cat("Any incomplete cases in development set?", any(!complete.cases(trainData[-val_indices_joined])),fill=T)
-cat("Any incomplete cases in val_indices_ori set?",any(!complete.cases(trainData[val_indices_joined,])),fill=T)
+cat("Any incomplete cases in validation set?",any(!complete.cases(trainData[val_indices_joined,])),fill=T)
 cat("Any incomplete cases in testData set?",any(!complete.cases(testData)),fill=T)
 
 cat("Data set size before variable selection:",dim(trainData),fill=T)
@@ -294,7 +366,7 @@ cat("Before highly correlated:",dim(trainData),fill=T)
 
 # remove highly correlated variables
 trainCor <- cor( trainData, method='spearman')
-correlatedVars <- colnames(trainData)[findCorrelation(trainCor, cutoff = 0.95, verbose = F)]
+correlatedVars <- colnames(trainData)[findCorrelation(trainCor, cutoff = 0.99, verbose = F)]
 cat("Removed highly correlated cols:", length(correlatedVars), 
     "(of", length(names(trainData)), ")", correlatedVars, fill=T)
 trainData <- trainData[,!(names(trainData) %in% correlatedVars)]
@@ -351,8 +423,10 @@ print(ggplot(univariates2, aes(x=predictor, y=auc, fill=severity)) +
 
 # see https://www.r-project.org/nosvn/conferences/useR-2013/Tutorials/kuhn/user_caret_2up.pdf
 crossValidation <- trainControl(#method = "repeatedcv",
-                                method = "none", # Fitting Models Without Parameter Tuning
-                                repeats = 5, number=10,
+#                                 method = "none", # Fitting models without parameter tuning
+                                method = "cv",
+#                                 repeats = 5, 
+                                number=5,
                                 summaryFunction = mnLogLoss,
                                 classProbs = TRUE,
                                 verbose=T)
@@ -366,40 +440,78 @@ gbmGrid <- data.frame(interaction.depth = 10,
                       shrinkage = 0.02,
                       n.minobsinnode = 10)
 
-# now create model for all 3 outcomes seperately and score test set
+xgbGrid <- expand.grid(nrounds = 500,
+                      eta = c(0.05, 0.1, 0.2), # 0.01
+                      max_depth = seq(4,10,by=2),
+                      gamma = c(1, 2, 4), 
+                      colsample_bytree = 1, 
+                      min_child_weight = c(4,6,10))
+
 trainResults <- data.frame(id = train_ori_id, 
                            obs = factor(paste("predict",train_ori_fault_severity,sep="_")))
 testResults <- data.frame(id = test_ori_id)
 
-# seperate two-class models:
-for (target in c(0,1,2)) {
-  cat("Predicting (single-class)", target, fill=T)
-  trainData$y <- factor(ifelse(train_ori_fault_severity == target, "Yes", "No")) 
-  
+if (doMultiClass) {
+  # single multi-class model
+  cat("Predicting (multi-class)", fill=T)
+  trainData$y <- as.factor(train_ori_fault_severity)
+  levels(trainData$y) <- paste("predict",levels(trainData$y),sep="_")
   model <- train(y ~ ., 
                  data = trainData[-val_indices_ori,], 
-                 method = "gbm" # "glmnet" #"rpart"
+                 method = "xgbTree" # gbm "glmnet" #"rpart"
                  #                    ,tuneLength = 10
-                 ,tuneGrid = gbmGrid
+                 ,tuneGrid = xgbGrid # gbmGrid
                  ,metric = "logLoss"
                  ,maximize=F
                  ,trControl = crossValidation
                  ,verbose=F
   )
-  
-  if (nrow(gbmGrid) > 1) {
+
+  if (crossValidation$method != "none") {
     trellis.par.set(caretTheme())
     print(plot(model))
   }
   
-  trainResults[[paste("predict",target,sep="_")]] <- predict.train(model, trainData, type="prob")[,2]
-  testResults[[paste("predict",target,sep="_")]] <- predict.train(model, testData, type="prob")[,2]
+  trainResults <- cbind(trainResults, predict.train(model, trainData, type="prob"))
+  testResults <- cbind(testResults, predict.train(model, testData, type="prob"))
+} else {
+  # seperate two-class models for each outcome level:
+  for (target in c(0,1,2)) {
+    cat("Predicting (single-class)", target, fill=T)
+    trainData$y <- factor(ifelse(train_ori_fault_severity == target, "Yes", "No")) 
+    
+    model <- train(y ~ ., 
+                   data = trainData[-val_indices_ori,], 
+                   method = "xgbTree" # gbm "glmnet" #"rpart"
+                   #                    ,tuneLength = 10
+                   ,tuneGrid = xgbGrid # gbmGrid
+                   ,metric = "logLoss"
+                   ,maximize=F
+                   ,trControl = crossValidation
+                   ,verbose=F
+    )
+    
+    if (crossValidation$method != "none") {
+      trellis.par.set(caretTheme())
+      print(plot(model))
+    }
+    
+    trainResults[[paste("predict",target,sep="_")]] <- predict.train(model, trainData, type="prob")[,2]
+    testResults[[paste("predict",target,sep="_")]] <- predict.train(model, testData, type="prob")[,2]
+  }
 }
 
+# if validation not none; model$bestTune / model$finalModel
 # Get val_indices_ori score
-score <- mnLogLoss(trainResults[val_indices_ori,], 
-                   lev=levels(trainResults$obs)) # Caret multi-class LogLoss
-cat("Validation score:", score, fill=T)
+
+if (crossValidation$method != "none") {
+  bestIdx <- as.integer(rownames(model$bestTune))
+  bestScore <- model$results$logLoss[bestIdx]
+} else {
+  bestScore <- mnLogLoss(trainResults[val_indices_ori,], 
+                     lev=levels(trainResults$obs)) # Caret multi-class LogLoss
+}
+cat("Validation score:", bestScore, fill=T)
 
 # Write submission score on test set
 write.table(testResults, "submission.csv", 
