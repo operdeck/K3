@@ -74,7 +74,8 @@ library(gbm)
 # Fitting nrounds = 4000, eta = 0.01, max_depth = 10, gamma = 1, colsample_bytree = 1, min_child_weight = 6 on full training set
 # 0.4393507 0.67235     grmpf - strange rank index added
 # 0.5326185 0.55223*    xgb with param tuning and no supervised binning
-
+# 0.5406384 0.54613*    minimal val %, tuning: Fitting nrounds = 500, max_depth = 4, eta = 0.2, gamma = 1, colsample_bytree = 1, min_child_weight = 4 on full training set
+#
 # .. maybe add another cluster as well on event_type?? and do that first??
 # .. for the fun of it - try returning bin index instead of recoded values
 # .. w/o tuning just use parameters
@@ -82,7 +83,7 @@ library(gbm)
 
 
 set.seed(491)
-val_fraction <- 0.10
+val_fraction <- 0.01
 doMultiClass <- T # multi-class or seperate predictions for each level
 
 trn_ori <- fread("data/train.csv")
@@ -302,11 +303,11 @@ aggregate <- function(idCol, valCol, colNamePrefix) {
 #                                               first = first(val),
 #                                               last = last(val),
                                               # seems to have a negative impact:
-#                                               mad = mad(val),
+                                              mad = mad(val),
                                               #                                        distinct = n_distinct(val), # seems to have a negative impact
                                               # this introduces NAs:
                                               sd = sd(val), 
-#                                               median = median(val),
+                                              median = median(val),
 #                                               iqr = IQR(val),
                                               n = n())   
   setnames(s, c("id",paste(colNamePrefix,names(s),sep="_")[2:length(names(s))]))
