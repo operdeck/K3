@@ -70,17 +70,13 @@ library(gbm)
 # 0.444007  0.60682     same, recode instead of rank
 # 0.4390447 0.59842     few more aggregates (median etc)
 # 0.4369168 (TODO)      packages updates and back to bagImputation (vs median); 10% val Final set: 7381 x 70
-# 0.4440401 (TODO)      same with xgbTree
-# Fitting nrounds = 4000, eta = 0.01, max_depth = 10, gamma = 1, colsample_bytree = 1, min_child_weight = 6 on full training set
+# 0.4440401 (TODO)      same with xgbTree - symbinning probably culprit
 # 0.4393507 0.67235     grmpf - strange rank index added
 # 0.5326185 0.55223*    xgb with param tuning and no supervised binning
-# 0.5406384 0.54613*    minimal val %, tuning: Fitting nrounds = 500, max_depth = 4, eta = 0.2, gamma = 1, colsample_bytree = 1, min_child_weight = 4 on full training set
-#
-# .. maybe add another cluster as well on event_type?? and do that first??
-# .. for the fun of it - try returning bin index instead of recoded values
-# .. w/o tuning just use parameters
-# time for XGB?
-
+# 0.5406384 0.54613*    1% val (not used), nrounds = 500, max_depth = 4, eta = 0.2, gamma = 1, colsample_bytree = 1, min_child_weight = 4 on full training set
+# 0.5265864 0.54675     same LB position,  nrounds = 500, max_depth = 4, eta = 0.2, gamma = 1, colsample_bytree = 1, min_child_weight = 8 on full training set
+# 0.5441018 0.54751     same LB position,  nrounds = 900, max_depth = 6, eta = 0.2, gamma = 2, colsample_bytree = 1, min_child_weight = 8
+# 0.5280975 0.53737*    few more aggregators, rnds = 900, max_depth = 13, eta = 0.1, gamma = 2, colsample_bytree = 1, min_child_weight = 8
 
 set.seed(491)
 val_fraction <- 0.01
@@ -136,16 +132,18 @@ hotOneResourceType <- data.table(id=resource_type$id,
 train_joined <- trn_ori %>%
   left_join(log_feature) %>%
   left_join(event_type) %>%
+  left_join(severity_type) %>%
+  left_join(resource_type) %>%
   left_join(hotOneSeverityType) %>% 
   left_join(hotOneResourceType)
 test_joined <- tst_ori %>%
   left_join(log_feature) %>%
   left_join(event_type) %>%
+  left_join(severity_type) %>%
+  left_join(resource_type) %>%
   left_join(hotOneSeverityType) %>% 
   left_join(hotOneResourceType)
 val_indices_joined <- which( train_joined$id %in% train_ori_id[ val_indices_ori ])
-
-# print(filter(train_joined, location=="location 1111"))
 
 # Try un-supervised clustering for "location", "log_feature" and "event_type"
 clusterSource <- rbind(select(trn_ori, -fault_severity), tst_ori) %>%
@@ -185,11 +183,11 @@ for (clusterColIndex in symCols) {
   
   nClusters <- NA
   if (clusterColName == "event_type") {
-    nClusters <- 5
+    nClusters <- 20 # 53 unique values (train)
   } else if (clusterColName == "log_feature") {
-    nClusters <- 10
+    nClusters <- 50 # 386 unique
   } else if (clusterColName == "location") {
-    nClusters <- 20
+    nClusters <- 50 # 929 unique
   }
   # Create a table with just the cluster column and the cluster index and join
   # these to the train/test sets. Potentially we could also add all summarized/aggregated
@@ -262,7 +260,14 @@ myAUC <- function(response, predictor)
 {
   df <- data.frame(predictor = predictor, response = response)
   df <- df[complete.cases(df),]
-  return (auc(df$response, df$predictor))
+
+  # numerical correct way to calculate AUC
+  r <- as.numeric(rank(df$predictor))
+  n_pos <- as.numeric(sum(response)) 
+  n_neg <- as.numeric(length(response) - n_pos)
+  auc <- (sum(r[response]) - n_pos * (n_pos + 1)/2)/(n_pos *  n_neg)
+  
+  return(auc)
 }
 
 # Only keep numerics
@@ -300,15 +305,15 @@ aggregate <- function(idCol, valCol, colNamePrefix) {
   s <- group_by(ds, id) %>% dplyr::summarise( min = min(val),
                                               max = max(val),
                                               mean = mean(val),
-#                                               first = first(val),
-#                                               last = last(val),
+                                              first = first(val),
+                                              last = last(val),
                                               # seems to have a negative impact:
                                               mad = mad(val),
-                                              #                                        distinct = n_distinct(val), # seems to have a negative impact
+                                              distinct = n_distinct(val), # seems to have a negative impact
                                               # this introduces NAs:
                                               sd = sd(val), 
                                               median = median(val),
-#                                               iqr = IQR(val),
+                                              iqr = IQR(val),
                                               n = n())   
   setnames(s, c("id",paste(colNamePrefix,names(s),sep="_")[2:length(names(s))]))
   return(s)
@@ -441,12 +446,12 @@ gbmGrid <- data.frame(interaction.depth = 10,
                       shrinkage = 0.02,
                       n.minobsinnode = 10)
 
-xgbGrid <- expand.grid(nrounds = 500,
-                      eta = c(0.05, 0.1, 0.2), # 0.01
-                      max_depth = seq(4,10,by=2),
-                      gamma = c(1, 2, 4), 
+xgbGrid <- expand.grid(nrounds = seq(500,1000,by=200),
+                      eta = c(0.1, 0.2, 0.3), # 0.01
+                      max_depth = seq(5,14,by=2),
+                      gamma = c(2, 3, 4), 
                       colsample_bytree = 1, 
-                      min_child_weight = c(4,6,10))
+                      min_child_weight = 8) # seems not to matter much
 
 trainResults <- data.frame(id = train_ori_id, 
                            obs = factor(paste("predict",train_ori_fault_severity,sep="_")))
